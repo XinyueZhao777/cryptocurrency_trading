@@ -1,0 +1,810 @@
+---
+title: "Data processing and regression analysis of cryptocurrency settlement data"
+output:
+  html_document:
+    highlight: zenburn
+    theme: flatly
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    code_folding: show
+---
+```{r setup, include=FALSE}
+options(knitr.table.format = "html") 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE,  dpi = 300)
+
+library(magrittr)
+library(dplyr)
+library(readxl)
+library(tidyverse)
+library(ggraph)
+library(ggrepel)
+library(tidygraph)
+library(rgeos)
+library(openxlsx)
+library(ggplot2)
+library(fixest)
+library(fastDummies)
+library(magick)
+library(tinytex)
+library(pdftools)
+library(xtable)
+library(forecast)
+library(tseries)
+library(vars)
+library(changepoint)
+library(tidyverse)
+library(zoo)
+library(plm)
+library(texreg)
+library(strucchange)
+```
+
+
+# Data processing
+```{r}
+# summurize the volumn of all fee tiers
+# Clear your workspace by removing all objects returned by ls():
+rm(list = ls()) 
+# Set the working directory to the folder containing the workshop files:
+setwd("/Users/hedwig/Dropbox/settlement_asset/data/") 
+
+df_all_1 <- read.csv("pairs_volume_V3_12032022.csv", header=T,stringsAsFactors = F)
+df_all_1 <- df_all_1[, -c(1)]%>%
+  mutate(symbol_pair= paste(poolDayDatas.pool.token0.symbol, poolDayDatas.pool.token1.symbol, sep = ","),
+         fake = 0)%>%
+  group_by(poolDayDatas.date, symbol_pair)%>%
+  mutate(sum_poolDayDatas.volumeUSD = sum(poolDayDatas.volumeUSD, na.rm = TRUE))%>%
+  ungroup()%>%
+  dplyr::select(poolDayDatas.date, poolDayDatas.pool.feeTier, poolDayDatas.pool.token0.symbol, poolDayDatas.pool.token1.symbol, symbol_pair, fake, poolDayDatas.volumeUSD, sum_poolDayDatas.volumeUSD)%>%
+  pivot_wider(names_from = poolDayDatas.pool.feeTier, values_from = poolDayDatas.volumeUSD)
+
+
+df_all_2 <- read.csv("pairs_volume_V3_12032022.csv", header=T,stringsAsFactors = F)
+df_all_2 <- df_all_2[, -c(1)]%>%
+  mutate(symbol_pair= paste(poolDayDatas.pool.token1.symbol, poolDayDatas.pool.token0.symbol, sep = ","),
+         fake = 1)%>%
+  group_by(poolDayDatas.date, symbol_pair)%>%
+  mutate(sum_poolDayDatas.volumeUSD = sum(poolDayDatas.volumeUSD, na.rm = TRUE))%>%
+  ungroup()%>%
+  dplyr::select(poolDayDatas.date, poolDayDatas.pool.feeTier, poolDayDatas.pool.token0.symbol, poolDayDatas.pool.token1.symbol, symbol_pair, fake, poolDayDatas.volumeUSD, sum_poolDayDatas.volumeUSD)%>%
+  pivot_wider(names_from = poolDayDatas.pool.feeTier, values_from = poolDayDatas.volumeUSD)
+
+
+df_all <- rbind(df_all_1,df_all_2)
+
+list <- read.xlsx("v3_tokenid.xlsx")%>%
+  rename(daily.volatility = `daily.volatility.(2018-2021.aug)`,
+         symbol = symbol.in.the.trading.data)
+
+#list_true <- df_all%>%
+#  select(poolDayDatas.pool.token0.symbol)%>%
+#  distinct()%>%
+#  rename(token = poolDayDatas.pool.token0.symbol)
+#list_true_2 <- df_all%>%
+#  select(poolDayDatas.pool.token1.symbol)%>%
+#  distinct()%>%
+#  rename(token = poolDayDatas.pool.token1.symbol)
+
+#list_true_3 <- rbind(list_true, list_true_2)%>%
+#  distinct()
+
+
+##### replace gas price variable with volatility variable and rerun all the regressions #####
+
+eth <- read.csv("ETH-USD.csv", header=T,stringsAsFactors = F)
+eth$Date <- as.Date(eth$Date)
+close <- zoo(eth$Close, seq(from = as.Date("2017-11-09"), to = as.Date("2022-04-29"), by = 1))
+log_returns <- diff(log(close), lag=1)
+eth_sd <- rollapply(log_returns, width=7, FUN = sd, align='right')
+log_returns <- cbind(index(log_returns), data.frame(log_returns))%>%
+  rename(Date = `index(log_returns)`)
+#log_returns_2 <-  diff(log(eth$Close), lag=1) Same
+eth <- left_join(eth, log_returns, by="Date")
+eth_sd <- cbind(index(eth_sd), data.frame(eth_sd))%>%
+  rename(Date = `index(eth_sd)`)
+eth <- left_join(eth, eth_sd, by="Date")
+#write.csv(eth, file='ETH_vol.csv')
+
+AvgGasPrice <- read.csv("export-AvgGasPrice(1).csv", header=T,stringsAsFactors = F)%>%
+  rename(poolDayDatas.date = UnixTimeStamp)
+AvgGasPrice$Date <- as.Date(AvgGasPrice$Date.UTC., format = "%m / %d / %Y")
+AvgGasPrice <- AvgGasPrice%>%
+  left_join(eth, by="Date")%>%
+  dplyr::select(poolDayDatas.date, Date.UTC., Date, Value..Wei., log_returns, eth_sd)
+
+AvgGasPrice_subset <- subset(AvgGasPrice, !(is.na(eth_sd)))
+####################################################################################
+
+df_triplets <- data.frame(symbol0 = c(0),
+                 symbol1 = c(0),
+                 symbol2 = c(0)
+                 )
+for (i in 1:(length(list$symbol)-2)){
+  for (j in (i+1):(length(list$symbol)-1)){
+    for (k in (j+1):length(list$symbol)){
+      df_triplets[nrow(df_triplets) + 1,] = c(list$symbol[i], list$symbol[j], list$symbol[k])
+    }
+  }
+}
+df_triplets <-  df_triplets[-c(1), ]
+
+list_0 <- list%>%
+  rename(symbol0 = symbol)
+df_triplets <- df_triplets%>%
+  left_join(list_0, by='symbol0')%>%
+  rename(code0 = stability.code,
+         volatility0 = daily.volatility)%>%
+  dplyr::select(symbol0, code0, volatility0, symbol1,symbol2 )
+
+list_1 <- list%>%
+  rename(symbol1 = symbol)
+df_triplets <- df_triplets%>%
+  left_join(list_1, by='symbol1')%>%
+  rename(code1 = stability.code,
+         volatility1 = daily.volatility)%>%
+  dplyr::select(symbol0, code0, volatility0, symbol1, code1, volatility1, symbol2 )
+
+list_2 <- list%>%
+  rename(symbol2 = symbol)
+df_triplets <- df_triplets%>%
+  left_join(list_2, by='symbol2')%>%
+  rename(code2 = stability.code,
+         volatility2 = daily.volatility)%>%
+  dplyr::select(symbol0, code0, volatility0, symbol1, code1, volatility1, symbol2, code2, volatility2 )
+
+
+df_triplets <- df_triplets%>%
+  mutate(symbol_triplet = paste(symbol0, symbol1, symbol2, sep = ","),
+         stability.code_triplet = paste(code0, code1, code2, sep = ","),
+         symbol_pair1 = paste(symbol0, symbol1, sep = ","),
+         stability.code_pair1 = paste(code0, code1, sep = ","),
+         symbol_pair2 = paste(symbol1, symbol2, sep = ","),
+         stability.code_pair2 = paste(code1, code2, sep = ","),
+         symbol_pair3 = paste(symbol0, symbol2, sep = ","),
+         stability.code_pair3 = paste(code0, code2, sep = ",")
+  )
+
+df_all_pair1 <- df_all%>%
+  rename(symbol_pair1 = symbol_pair)
+df_pair1 <- df_triplets%>%
+  left_join(df_all_pair1, by=c('symbol_pair1'))%>%
+  rename(volumeUSD_pair1_sum = sum_poolDayDatas.volumeUSD,
+         volumeUSD_pair1_500 = `500`,
+         volumeUSD_pair1_3000 = `3000`,
+         volumeUSD_pair1_10000 = `10000`,
+         volumeUSD_pair1_100 = `100`)%>%
+  dplyr::select(poolDayDatas.date, symbol_triplet, stability.code_triplet, symbol_pair1, stability.code_pair1, symbol_pair2, stability.code_pair2, symbol_pair3, stability.code_pair3, volumeUSD_pair1_sum, volumeUSD_pair1_500, volumeUSD_pair1_3000, volumeUSD_pair1_10000, volumeUSD_pair1_100)
+
+df_all_pair2 <- df_all%>%
+  rename(symbol_pair2 = symbol_pair)
+df_pair2 <- df_triplets%>%
+  left_join(df_all_pair2, by='symbol_pair2')%>%
+  rename(volumeUSD_pair2_sum = sum_poolDayDatas.volumeUSD,
+         volumeUSD_pair2_500 = `500`,
+         volumeUSD_pair2_3000 = `3000`,
+         volumeUSD_pair2_10000 = `10000`,
+         volumeUSD_pair2_100 = `100`)%>%
+  dplyr::select(poolDayDatas.date, symbol_triplet, stability.code_triplet, symbol_pair1, stability.code_pair1, symbol_pair2, stability.code_pair2, symbol_pair3, stability.code_pair3, volumeUSD_pair2_sum, volumeUSD_pair2_500, volumeUSD_pair2_3000, volumeUSD_pair2_10000, volumeUSD_pair2_100)
+
+
+df_all_pair3 <- df_all%>%
+  rename(symbol_pair3 = symbol_pair)
+df_pair3 <- df_triplets%>%
+  left_join(df_all_pair3, by='symbol_pair3')%>%
+  rename(volumeUSD_pair3_sum = sum_poolDayDatas.volumeUSD,
+         volumeUSD_pair3_500 = `500`,
+         volumeUSD_pair3_3000 = `3000`,
+         volumeUSD_pair3_10000 = `10000`,
+         volumeUSD_pair3_100 = `100`)%>%
+  dplyr::select(poolDayDatas.date, symbol_triplet, stability.code_triplet, symbol_pair1, stability.code_pair1, symbol_pair2, stability.code_pair2, symbol_pair3, stability.code_pair3,  volumeUSD_pair3_sum, volumeUSD_pair3_500, volumeUSD_pair3_3000, volumeUSD_pair3_10000, volumeUSD_pair3_100)
+
+
+df_final_12 <- full_join(df_pair1, df_pair2, by = c('poolDayDatas.date', 'symbol_triplet', 'stability.code_triplet', 'symbol_pair1', 'stability.code_pair1', 'symbol_pair2', 'stability.code_pair2', 'symbol_pair3', 'stability.code_pair3'))
+df_final <- full_join(df_final_12, df_pair3, by = c('poolDayDatas.date', 'symbol_triplet', 'stability.code_triplet', 'symbol_pair1', 'stability.code_pair1', 'symbol_pair2', 'stability.code_pair2', 'symbol_pair3', 'stability.code_pair3'))%>%
+  dplyr::select(poolDayDatas.date, symbol_triplet, stability.code_triplet, symbol_pair1, stability.code_pair1, volumeUSD_pair1_sum, volumeUSD_pair1_500, volumeUSD_pair1_3000, volumeUSD_pair1_10000, volumeUSD_pair1_100, symbol_pair2, stability.code_pair2, volumeUSD_pair2_sum, volumeUSD_pair2_500, volumeUSD_pair2_3000, volumeUSD_pair2_10000, volumeUSD_pair2_100, symbol_pair3, stability.code_pair3, volumeUSD_pair3_sum, volumeUSD_pair3_500, volumeUSD_pair3_3000, volumeUSD_pair3_10000, volumeUSD_pair3_100)%>%
+#  left_join(AvgGasPrice, by='poolDayDatas.date')
+  left_join(AvgGasPrice_subset, by='poolDayDatas.date')
+
+df_final$Date <- as.character(df_final$Date) 
+df_final[is.na(df_final)] <- 0
+
+df_final_sumfeetier <- df_final%>%
+  dplyr::select(poolDayDatas.date, symbol_triplet, stability.code_triplet, symbol_pair1, stability.code_pair1, volumeUSD_pair1_sum, symbol_pair2, stability.code_pair2, volumeUSD_pair2_sum, symbol_pair3, stability.code_pair3, volumeUSD_pair3_sum, Date,  Value..Wei., eth_sd)%>%
+  distinct()%>%
+  mutate(allpairs = volumeUSD_pair1_sum+ volumeUSD_pair2_sum+ volumeUSD_pair3_sum,
+         percent_pair1 = volumeUSD_pair1_sum/allpairs,
+         percent_pair2 = volumeUSD_pair2_sum/allpairs,
+         percent_pair3 = volumeUSD_pair3_sum/allpairs)
+df_final_sumfeetier=subset(df_final_sumfeetier, !((volumeUSD_pair1_sum == 0)&(volumeUSD_pair2_sum == 0)&(volumeUSD_pair3_sum == 0)))
+
+df_final_500feetier <- df_final%>%
+  dplyr::select(poolDayDatas.date, symbol_triplet, stability.code_triplet, symbol_pair1, stability.code_pair1, volumeUSD_pair1_500, symbol_pair2, stability.code_pair2, volumeUSD_pair2_500, symbol_pair3, stability.code_pair3, volumeUSD_pair3_500, Date, Value..Wei., eth_sd)%>%
+  distinct()%>%
+  mutate(allpairs = volumeUSD_pair1_500+ volumeUSD_pair2_500+ volumeUSD_pair3_500,
+         percent_pair1 = volumeUSD_pair1_500/allpairs,
+         percent_pair2 = volumeUSD_pair2_500/allpairs,
+         percent_pair3 = volumeUSD_pair3_500/allpairs)
+df_final_500feetier=subset(df_final_500feetier, !((volumeUSD_pair1_500 == 0)&(volumeUSD_pair2_500 == 0)&(volumeUSD_pair3_500 == 0)))
+
+
+df_final_100feetier <- df_final%>%
+  dplyr::select(poolDayDatas.date, symbol_triplet, stability.code_triplet, symbol_pair1, stability.code_pair1, volumeUSD_pair1_100, symbol_pair2, stability.code_pair2, volumeUSD_pair2_100, symbol_pair3, stability.code_pair3, volumeUSD_pair3_100, Date, Value..Wei., eth_sd)%>%
+  distinct()%>%
+  mutate(allpairs = volumeUSD_pair1_100+ volumeUSD_pair2_100+ volumeUSD_pair3_100,
+         percent_pair1 = volumeUSD_pair1_100/allpairs,
+         percent_pair2 = volumeUSD_pair2_100/allpairs,
+         percent_pair3 = volumeUSD_pair3_100/allpairs)
+df_final_100feetier=subset(df_final_100feetier, !((volumeUSD_pair1_100 == 0)&(volumeUSD_pair2_100 == 0)&(volumeUSD_pair3_100 == 0)))
+
+
+```
+
+
+# Regression analysis and summary statistics
+```{r}
+reg_data <- function(df_final_sumfeetier) {
+  
+sumfeetier_reg <- df_final_sumfeetier%>%
+  pivot_longer(cols = c(17,18,19), names_to = 'pair', values_to = 'percent_in_triplet')%>%
+  rename(volatility_ETH = eth_sd,
+         gas_fee = Value..Wei.)%>%
+  mutate(
+    stability_code = case_when(
+           str_detect(pair, 'pair1') ~ stability.code_pair1,
+           str_detect(pair, 'pair2') ~ stability.code_pair2,
+           str_detect(pair, 'pair3') ~ stability.code_pair3),
+         
+         symbol_pair = case_when(
+           str_detect(pair, 'pair1') ~ symbol_pair1,
+           str_detect(pair, 'pair2') ~ symbol_pair2,
+           str_detect(pair, 'pair3') ~ symbol_pair3),
+)%>%
+  mutate(
+   dummy0 = case_when(
+           str_detect(stability_code, '0') ~ 1,
+           TRUE ~ 0),
+   dummy1 = case_when(
+           str_detect(stability_code, '1') ~ 1,
+           TRUE ~ 0),
+   stability_code = 
+           case_when(
+             str_detect(stability_code, '1')&str_detect(stability_code, '2') ~ '1,2',
+             TRUE ~ stability_code)
+  )%>%
+  dummy_cols(select_columns = 'stability_code')
+
+return(sumfeetier_reg)
+}
+
+
+reg_output <- function(sumfeetier_reg, tablename) {
+
+mod_0 <- lm(percent_in_triplet ~ 1 , data = sumfeetier_reg)
+summary(mod_0, cluster = "symbol_triplet")
+  
+mod_fe <- feols(percent_in_triplet ~ volatility_ETH | symbol_triplet, data = sumfeetier_reg)
+summary(mod_fe, cluster = "symbol_triplet")
+
+mod_fe_1 <- feols(percent_in_triplet ~ volatility_ETH*dummy0 + volatility_ETH*dummy1 | symbol_triplet, data = sumfeetier_reg)
+summary(mod_fe_1, cluster = "symbol_triplet")
+  
+mod_fe_2 <- feols(percent_in_triplet ~ volatility_ETH*dummy0 + volatility_ETH*dummy1 + volatility_ETH*dummy1*dummy0 | symbol_triplet, data = sumfeetier_reg)
+summary(mod_fe_2, cluster = "symbol_triplet")
+
+mod_fe_3 <- feols(percent_in_triplet ~ volatility_ETH*dummy0 + volatility_ETH*dummy1 + volatility_ETH*dummy1*dummy0 +  `stability_code_0,1`+`stability_code_0,2`+`stability_code_0,3`+`stability_code_0,4` + `stability_code_1,1`+`stability_code_1,2`+`stability_code_1,3`+`stability_code_1,4`| symbol_triplet, data = sumfeetier_reg)
+summary(mod_fe_3, cluster = "symbol_triplet")
+
+
+texreg(mod_0,  caption =paste("Regression 0 of", tablename, sep=' ') ,caption.above =TRUE, file =paste("Regression 0 of ", tablename, ".tex", sep=''))
+
+etable(mod_fe, mod_fe_1, mod_fe_2,mod_fe_3, tex = TRUE, title = paste("Regression of", tablename, sep=' '), adjustbox = 1.2, file=paste("Regression of ", tablename, ".tex", sep=''))
+
+}
+
+
+summary_pertier <- function(reg_sumfeetier) {
+  summary_sta_sum <- reg_sumfeetier%>%
+  dplyr::select(percent_in_triplet)%>%
+  subset(!(is.na(percent_in_triplet)))%>%
+  gather(variable, value) %>%
+  group_by(variable) %>%
+  summarise(n = sum(!is.na(value)),
+            `Mean` = mean(value),
+            `Std. Dev.` = sd(value),
+            `Median` = median(value),
+            `Min.` = min(value),
+            `Max.` = max(value))
+  
+  summary_sta_sum_0 <- reg_sumfeetier%>%
+    filter(dummy0 == 1)%>%
+  dplyr::select(percent_in_triplet)%>%
+  subset(!(is.na(percent_in_triplet)))%>%
+    rename(percent_in_triplet_leg_0 = percent_in_triplet)%>%
+  gather(variable, value) %>%
+  group_by(variable) %>%
+  summarise(n = sum(!is.na(value)),
+            `Mean` = mean(value),
+            `Std. Dev.` = sd(value),
+            `Median` = median(value),
+            `Min.` = min(value),
+            `Max.` = max(value))
+  
+   summary_sta_sum_1 <- reg_sumfeetier%>%
+    filter(dummy1 == 1)%>%
+  dplyr::select(percent_in_triplet)%>%
+  subset(!(is.na(percent_in_triplet)))%>%
+     rename(percent_in_triplet_leg_1 = percent_in_triplet)%>%
+  gather(variable, value) %>%
+  group_by(variable) %>%
+  summarise(n = sum(!is.na(value)),
+            `Mean` = mean(value),
+            `Std. Dev.` = sd(value),
+            `Median` = median(value),
+            `Min.` = min(value),
+            `Max.` = max(value))
+   
+    summary_sta_sum_01 <- reg_sumfeetier%>%
+    filter((dummy0 == 1) & (dummy1==1))%>%
+  dplyr::select(percent_in_triplet)%>%
+  subset(!(is.na(percent_in_triplet)))%>%
+      rename(`percent_in_triplet_leg_0,1` = percent_in_triplet)%>%
+  gather(variable, value) %>%
+  group_by(variable) %>%
+  summarise(n = sum(!is.na(value)),
+            `Mean` = mean(value),
+            `Std. Dev.` = sd(value),
+            `Median` = median(value),
+            `Min.` = min(value),
+            `Max.` = max(value))
+ 
+    summary_sta_sum_0or1 <- reg_sumfeetier%>%
+    filter((dummy0 == 1) | (dummy1==1))%>%
+  dplyr::select(percent_in_triplet)%>%
+  subset(!(is.na(percent_in_triplet)))%>%
+      rename(`percent_in_triplet_leg_0/1` = percent_in_triplet)%>%
+  gather(variable, value) %>%
+  group_by(variable) %>%
+  summarise(n = sum(!is.na(value)),
+            `Mean` = mean(value),
+            `Std. Dev.` = sd(value),
+            `Median` = median(value),
+            `Min.` = min(value),
+            `Max.` = max(value))
+    
+    summary_sta_sum_11 <- reg_sumfeetier%>%
+    filter(stability_code == "1,1" )%>%
+  dplyr::select(percent_in_triplet)%>%
+  subset(!(is.na(percent_in_triplet)))%>%
+      rename(`percent_in_triplet_leg_1,1` = percent_in_triplet)%>%
+  gather(variable, value) %>%
+  group_by(variable) %>%
+  summarise(n = sum(!is.na(value)),
+            `Mean` = mean(value),
+            `Std. Dev.` = sd(value),
+            `Median` = median(value),
+            `Min.` = min(value),
+            `Max.` = max(value))
+    
+    summary_sta_sum <- summary_sta_sum%>%
+      rbind(summary_sta_sum_0)%>%
+      rbind(summary_sta_sum_1)%>%
+      rbind(summary_sta_sum_01)%>%
+      rbind(summary_sta_sum_0or1)%>%
+      rbind(summary_sta_sum_11)
+    
+    return(summary_sta_sum)
+}
+
+```
+
+
+```{r}
+reg_sumfeetier <- reg_data(df_final_sumfeetier)
+reg_output(reg_sumfeetier, "sum across all feetiers")
+
+reg_500feetier <- reg_data(df_final_500feetier)
+reg_output(reg_500feetier, "500 feetier")
+
+
+reg_100feetier <- reg_data(df_final_100feetier)
+reg_output(reg_100feetier, "100 feetier")
+
+#write.csv(reg_sumfeetier, file = 'sum_fee_tier.csv')
+#write.csv(reg_500feetier, file = '500_fee_tier.csv')
+#write.csv(reg_100feetier, file = '100_fee_tier.csv')
+#write.csv(df_final, file = 'percent_in_triplet_data.csv')
+
+table_sum <- summary_pertier(reg_sumfeetier)
+xtable(table_sum, caption = 'Summary statistics of sum feetier (no dropping)')
+
+table_500 <- summary_pertier(reg_500feetier)
+xtable(table_500, caption = 'Summary statistics of 500 feetier (no dropping)')
+
+table_100 <- summary_pertier(reg_100feetier)
+xtable(table_100, caption = 'Summary statistics of 100 feetier (no dropping)')
+```
+
+
+# Winsorize variables at 1% and 99%, and do regression and summary again 
+```{r}
+# functions
+winsorize_data <- function(df_final_sumfeetier){
+  df_final_sumfeetier_win <- subset(df_final_sumfeetier, !(percent_pair1>0.99 | percent_pair2>0.99 | percent_pair3>0.99))
+  df_final_sumfeetier_win2 <- subset(df_final_sumfeetier_win, !(percent_pair1<0.01 | percent_pair2<0.01 | percent_pair3<0.01))
+  return(df_final_sumfeetier_win2)
+}
+
+reg_output_win_sum <- function(sumfeetier_reg, tablename) {
+
+mod_0 <- lm(percent_in_triplet ~ 1 , data = sumfeetier_reg)
+summary(mod_0, cluster = "symbol_triplet")
+  
+mod_fe <- feols(percent_in_triplet ~ volatility_ETH | symbol_triplet, data = sumfeetier_reg)
+summary(mod_fe, cluster = "symbol_triplet")
+
+mod_fe_1 <- feols(percent_in_triplet ~ volatility_ETH*dummy0 + volatility_ETH*dummy1 | symbol_triplet, data = sumfeetier_reg)
+summary(mod_fe_1, cluster = "symbol_triplet")
+  
+mod_fe_2 <- feols(percent_in_triplet ~ volatility_ETH*dummy0 + volatility_ETH*dummy1 + volatility_ETH*dummy1*dummy0 | symbol_triplet, data = sumfeetier_reg)
+summary(mod_fe_2, cluster = "symbol_triplet")
+
+mod_fe_3 <- feols(percent_in_triplet ~ volatility_ETH*dummy0 + volatility_ETH*dummy1 + volatility_ETH*dummy1*dummy0 +  `stability_code_0,1`+`stability_code_0,2`+`stability_code_0,3`+`stability_code_0,4` +`stability_code_1,2`+`stability_code_1,3`+`stability_code_1,4`| symbol_triplet, data = sumfeetier_reg)
+summary(mod_fe_3, cluster = "symbol_triplet")
+
+mod_fe_4 <- feols(percent_in_triplet ~ gas_fee + volatility_ETH*dummy0 + volatility_ETH*dummy1 + volatility_ETH*dummy1*dummy0 +  `stability_code_0,1`+`stability_code_0,2`+`stability_code_0,3`+`stability_code_0,4` +`stability_code_1,2`+`stability_code_1,3`+`stability_code_1,4`| symbol_triplet, data = sumfeetier_reg)
+summary(mod_fe_4, cluster = "symbol_triplet")
+
+texreg(mod_0, model.names = c("Model (0)"),  caption =paste("Regression 0 of", tablename, sep=' ') ,caption.above =TRUE, file =paste("Regression 0 of ", tablename, ".tex", sep=''))
+
+etable(mod_fe, mod_fe_1, mod_fe_2,mod_fe_3, mod_fe_4, tex = TRUE, title = paste("Regression of", tablename, sep=' '), adjustbox = 1.2, file=paste("Regression of ", tablename, ".tex", sep=''))
+
+}
+
+
+reg_output_win_500 <- function(sumfeetier_reg, tablename) {
+
+mod_0 <- lm(percent_in_triplet ~ 1 , data = sumfeetier_reg)
+summary(mod_0, cluster = "symbol_triplet")
+  
+mod_fe <- feols(percent_in_triplet ~ volatility_ETH | symbol_triplet, data = sumfeetier_reg)
+summary(mod_fe, cluster = "symbol_triplet")
+
+mod_fe_1 <- feols(percent_in_triplet ~ volatility_ETH*dummy0 + volatility_ETH*dummy1 | symbol_triplet, data = sumfeetier_reg)
+summary(mod_fe_1, cluster = "symbol_triplet")
+  
+mod_fe_2 <- feols(percent_in_triplet ~ volatility_ETH*dummy0 + volatility_ETH*dummy1 + volatility_ETH*dummy1*dummy0 | symbol_triplet, data = sumfeetier_reg)
+summary(mod_fe_2, cluster = "symbol_triplet")
+
+mod_fe_3 <- feols(percent_in_triplet ~ volatility_ETH*dummy0 + volatility_ETH*dummy1 + volatility_ETH*dummy1*dummy0 +  `stability_code_0,1`+`stability_code_0,2`+`stability_code_0,3`+ `stability_code_1,3`| symbol_triplet, data = sumfeetier_reg)
+summary(mod_fe_3, cluster = "symbol_triplet")
+
+mod_fe_4 <- feols(percent_in_triplet ~ gas_fee + volatility_ETH*dummy0 + volatility_ETH*dummy1 + volatility_ETH*dummy1*dummy0 +  `stability_code_0,1`+`stability_code_0,2`+`stability_code_0,3`+ `stability_code_1,3`| symbol_triplet, data = sumfeetier_reg)
+summary(mod_fe_4, cluster = "symbol_triplet")
+
+
+texreg(mod_0, model.names = c("Model (0)"), caption =paste("Regression 0 of", tablename, sep=' ') ,caption.above =TRUE, file =paste("Regression 0 of ", tablename, ".tex", sep=''))
+
+etable(mod_fe, mod_fe_1, mod_fe_2,mod_fe_3, mod_fe_4, tex = TRUE, title = paste("Regression of", tablename, sep=' '), adjustbox = 1.2, file=paste("Regression of ", tablename, ".tex", sep=''))
+
+}
+
+```
+
+
+```{r}
+
+df_final_sumfeetier_win <- winsorize_data(df_final_sumfeetier)
+reg_sumfeetier_win <- reg_data(df_final_sumfeetier_win)
+reg_output_win_sum(reg_sumfeetier_win, "sum across all feetiers (with volatility after winsorization)")
+
+
+df_final_500feetier_win <- winsorize_data(df_final_500feetier)
+reg_500feetier_win <- reg_data(df_final_500feetier_win)
+reg_output_win_500(reg_500feetier_win, "500 feetier (with volatility after winsorization)")
+
+df_final_100feetier_win <- winsorize_data(df_final_100feetier)
+# 100 feetier has no data after winsorizing
+
+table_sum_win <- summary_pertier(reg_sumfeetier_win)
+xtable(table_sum_win, caption = 'Summary statistics of sum feetier (with volatility after winsorization)')
+
+table_500_win <- summary_pertier(reg_500feetier_win)
+xtable(table_500_win, caption = 'Summary statistics of 500 feetier (with volatility after winsorization)')
+
+
+```
+
+
+
+# Strucutre breaks in gas fee
+
+## change in mean
+```{r}
+change_in_mean <- function(reg_sumfeetier_win){
+# use segmented neighbour method, which makes use of all the available data in the time series and appears to provide a slightly more accurate estimate of the change points in the mean
+sub_date <- reg_sumfeetier_win%>%dplyr::select(poolDayDatas.date, Date, gas_fee)%>%distinct()
+bp_fee_SegNeigh <- sub_date%>%
+  arrange(poolDayDatas.date)%>%
+  pull(gas_fee) %>%
+  cpt.mean(., penalty = "BIC", method = "SegNeigh", Q = 3)
+
+
+
+sub_date$mean_gas_fee <- 0
+n_beg <- 1
+for (ii in cpts(bp_fee_SegNeigh)){
+  sub_date$mean_gas_fee[n_beg:ii-1] <- mean(sub_date$gas_fee[n_beg:ii-1])
+  n_beg <- ii
+  if (ii == cpts(bp_fee_SegNeigh)[length(cpts(bp_fee_SegNeigh))]){
+    sub_date$mean_gas_fee[ii:length(sub_date$mean_gas_fee)] <- mean(sub_date$gas_fee[ii:length(sub_date$gas_fee)])
+  }
+}
+
+mean_gas_fee <- sub_date%>%distinct(mean_gas_fee)%>%arrange(mean_gas_fee)
+mean_gas_fee$mean_gasfee_tier <- c("low","high", "high")
+sub_date <- sub_date%>%left_join(mean_gas_fee, by='mean_gas_fee')
+
+plot(bp_fee_SegNeigh, type = "l", cpt.col = "blue", xlab = "Date", ylab = "Gas fee", cpt.width = 4)
+print(cpts(bp_fee_SegNeigh))
+return(sub_date)
+}
+```
+
+
+## regression analysis in low fee regime and high(the rest) fee regime
+
+We identify fee regimes in the regression data using Segment Neighborhood (SegNeigh, Auger 1989) algorithm to find the segmentation with the lowest cost among all possible segmentations that have the specified number of change points. Notice that here we use the winsorized data corresponding to the winsorized regression. For the winsorised data, 500 adn 100 fee tier has too few observation dates, so we skip them for now.
+```{r}
+means_gasfee_sum <- change_in_mean(reg_sumfeetier_win)
+reg_sumfeetier_win_1 <- reg_sumfeetier_win%>%
+  left_join(means_gasfee_sum, by=c("poolDayDatas.date","Date", "gas_fee"))
+reg_sumfeetier_win_low <- reg_sumfeetier_win_1%>%
+  filter(mean_gasfee_tier == "low")
+reg_sumfeetier_win_high <- reg_sumfeetier_win_1%>%
+  filter(mean_gasfee_tier == "high")
+
+reg_output_win_sum(reg_sumfeetier_win_low, "sum across all feetiers (with volatility after winsorization) in low fee regime")
+reg_output_win_sum(reg_sumfeetier_win_high, "sum across all feetiers (with volatility after winsorization) in other fee regime")
+
+# 500 fee tier only has trading on 15 days
+```
+We do another structural break test using breakpoints -- which yields the breakpoints of the minimum BIC partition. This method gives us breaks at 49 111 174 267.
+```{r}
+sub_date <- reg_sumfeetier_win%>%
+  dplyr::select(poolDayDatas.date, Date, gas_fee)%>%
+  distinct()%>%
+  arrange(poolDayDatas.date)
+
+ts_fee <- zoo(sub_date$gas_fee,  seq(from = as.Date("2021-05-05"), to = as.Date("2022-03-14"), by = 1))
+# test for structural breaks
+bp_fee <- breakpoints(ts_fee~1)
+bp_fee
+# plot the graph with breakdates and their confidence intervals
+plot(bp_fee)
+plot(sub_date$gas_fee, col='blue', type="l")
+abline(v=bp_fee$breakpoints)
+```
+
+
+# Time series analysis
+
+## Adding up all the percentages of legs with 0/1/0,1 (in order to have one observation per day) and take mean
+```{r}
+adding_legs <- function(reg_sumfeetier){
+# sum fee tier
+leg0_ts_sum <- reg_sumfeetier%>%
+  filter(str_detect(stability_code, '0'))%>%
+  group_by(poolDayDatas.date, Date)%>%
+  summarise(mean_leg0 = mean(percent_in_triplet, na.rm = TRUE))
+
+leg1_ts_sum <- reg_sumfeetier%>%
+  filter(str_detect(stability_code, '1'))%>%
+  group_by(poolDayDatas.date, Date)%>%
+  summarise(mean_leg1 = mean(percent_in_triplet, na.rm = TRUE))
+
+leg01_ts_sum <- reg_sumfeetier%>%
+  filter(str_detect(stability_code, '0') & str_detect(stability_code, '1'))%>%
+  group_by(poolDayDatas.date, Date)%>%
+  summarise(mean_leg01 = mean(percent_in_triplet, na.rm = TRUE))
+
+leg_all_ts_sum <- reg_sumfeetier%>%
+  group_by(poolDayDatas.date, Date)%>%
+  summarise(mean_leg_all = mean(percent_in_triplet, na.rm = TRUE))
+
+means_gasfee_sum <- change_in_mean(reg_sumfeetier)
+  
+legs_ts_sum <- leg0_ts_sum%>%
+  left_join(leg1_ts_sum, by=c("poolDayDatas.date", "Date"))%>%
+  left_join(leg01_ts_sum, by=c("poolDayDatas.date", "Date"))%>%
+  left_join(leg_all_ts_sum, by=c("poolDayDatas.date", "Date"))%>%
+  left_join(means_gasfee_sum, by=c("poolDayDatas.date", "Date"))
+#  mutate(percent_leg0 = mean_leg0/mean_leg_all,
+#         percent_leg1 = mean_leg1/mean_leg_all,
+#         percent_leg01 = mean_leg01/mean_leg_all)
+
+return(legs_ts_sum)
+}
+
+```
+
+```{r}
+legs_sum <- adding_legs(reg_sumfeetier)
+legs_500 <- adding_legs(reg_500feetier)
+legs_100 <- adding_legs(reg_100feetier)
+```
+
+
+## Arima analysis
+
+### sum fee tier, mean of leg0/1/0,1 percentages
+
+legs with 0 and legs with 1 both looks quite stable, and leg0 mean percentages are constantly higher. leg01 is much more volatile and seems to have structural break points in JUL 2021.
+```{r}
+ts_leg0_sum <- zoo(legs_sum$mean_leg0, seq(from = as.Date("2021-05-05"), to = as.Date("2022-03-14"), by = 1))
+ts_leg1_sum <- zoo(legs_sum$mean_leg1, seq(from = as.Date("2021-05-05"), to = as.Date("2022-03-14"), by = 1))
+ts_leg01_sum <- zoo(legs_sum$mean_leg01, seq(from = as.Date("2021-05-05"), to = as.Date("2022-03-14"), by = 1))
+
+
+plot(ts_leg0_sum,
+     col = 2,
+     ylim = c(0, 1),
+     xlab = "Date",
+     ylab = "mean of leg percentages")
+lines(ts_leg1_sum,
+      col = 3)
+lines(ts_leg01_sum,
+      col = 4)
+legend("bottomright",                           # Add legend to plot
+       c("ts_leg0_sum", "ts_leg1_sum", "ts_leg01_sum"),
+       lty = 1,
+       col = 2:4)
+```
+##### legs with 0:
+R auto fits the series with ARIMA(0,1,1), meaning that the series has 1 unit root. However the data looks quite stable.
+```{r}
+plot(ts_leg0_sum,
+     col = 2)
+acf(ts_leg0_sum, lag.max=34)
+pacf(ts_leg0_sum, lag.max=34)
+fit_ts_leg0_sum <- auto.arima(ts_leg0_sum)
+fit_ts_leg0_sum
+```
+
+##### legs with 1:
+ARIMA(2,1,1) with drift, looks corresponding to the stochastic pattern of data.
+```{r}
+acf(ts_leg1_sum, lag.max=34)
+pacf(ts_leg1_sum, lag.max=34)
+fit_ts_leg1_sum <- auto.arima(ts_leg1_sum)
+fit_ts_leg1_sum
+```
+
+##### legs of 0,1:
+ARIMA(1,1,2). The last 2 structural break points are 69 194 261, quite close to the gas fee structural break points (49 111 174 267) using the BIC method.
+```{r}
+acf(ts_leg01_sum, lag.max=34)
+pacf(ts_leg01_sum, lag.max=34)
+fit_ts_leg01_sum <- auto.arima(ts_leg01_sum)
+fit_ts_leg01_sum
+
+# test for structural breaks
+bp_01_sum <- breakpoints(ts_leg01_sum~1)
+bp_01_sum
+# plot the graph with breakdates and their confidence intervals
+plot(bp_01_sum)
+plot(legs_sum$mean_leg01, col='blue', type="l")
+abline(v=bp_01_sum$breakpoints)
+```
+
+### 500 fee tier, mean of leg0/1/0,1 percentages
+
+Similar patterns as sum fee tier, but leg01 is less volatile.
+```{r}
+ts_leg0_500 <- zoo(legs_500$mean_leg0, seq(from = as.Date("2021-05-05"), to = as.Date("2022-03-14"), by = 1))
+ts_leg1_500 <- zoo(legs_500$mean_leg1, seq(from = as.Date("2021-05-05"), to = as.Date("2022-03-14"), by = 1))
+ts_leg01_500 <- zoo(legs_500$mean_leg01, seq(from = as.Date("2021-05-05"), to = as.Date("2022-03-14"), by = 1))
+
+plot(ts_leg0_500,
+     col = 2,
+     ylim = c(0, 1),
+     xlab = "Date",
+     ylab = "mean of leg percentages")
+lines(ts_leg1_500,
+      col = 3)
+lines(ts_leg01_500,
+      col = 4)
+legend("bottomright",                           # Add legend to plot
+       c("ts_leg0_500", "ts_leg1_500", "ts_leg01_500"),
+       lty = 1,
+       col = 2:4)
+```
+
+##### legs with 0:
+R auto fits the series with ARIMA(3,1,3), meaning that the series has 1 unit root. There seems to be a structural break at time 47, which is close to the first gas fee structural break points (49).
+```{r}
+plot(ts_leg0_500,
+     col = 2)
+acf(ts_leg0_500, lag.max=34)
+pacf(ts_leg0_500, lag.max=34)
+fit_ts_leg0_500 <- auto.arima(ts_leg0_500)
+fit_ts_leg0_500
+
+# test for structural breaks
+bp_0_500 <- breakpoints(ts_leg0_500~1)
+bp_0_500
+# plot the graph with breakdates and their confidence intervals
+plot(bp_0_500)
+plot(legs_500$mean_leg0, col='blue', type="l")
+abline(v=bp_0_500$breakpoints)
+```
+
+##### legs with 1:
+ARIMA(0,1,1), looks corresponding to the stochastic pattern of data.
+```{r}
+acf(ts_leg1_500, lag.max=34)
+pacf(ts_leg1_500, lag.max=34)
+fit_ts_leg1_500 <- auto.arima(ts_leg1_500)
+fit_ts_leg1_500
+```
+
+##### legs of 0,1:
+ARIMA(2,1,1). BIC method indicates structural break points at 105 210.
+```{r}
+acf(ts_leg01_500, lag.max=34)
+pacf(ts_leg01_500, lag.max=34)
+fit_ts_leg01_500 <- auto.arima(ts_leg01_500)
+fit_ts_leg01_500
+
+# test for structural breaks
+bp_01_500 <- breakpoints(ts_leg01_500~1)
+bp_01_500
+# plot the graph with breakdates and their confidence intervals
+plot(bp_01_500)
+plot(legs_500$mean_leg01, col='blue', type="l")
+abline(v=bp_01_500$breakpoints)
+```
+
+### 100 fee tier, mean of leg0/1/0,1 percentages
+
+The patterns are much different from the previous 2 fee tiers, possibly due to the small number of trading observations in 100 fee tier.
+```{r}
+ts_leg0_100 <- zoo(legs_100$mean_leg0, seq(from = as.Date("2021-11-14"), to = as.Date("2022-03-14"), by = 1))
+ts_leg1_100 <- zoo(legs_100$mean_leg1, seq(from = as.Date("2021-11-14"), to = as.Date("2022-03-14"), by = 1))
+ts_leg01_100 <- zoo(legs_100$mean_leg01, seq(from = as.Date("2021-11-14"), to = as.Date("2022-03-14"), by = 1))
+fee_100 <- zoo(legs_100$gas_fee, seq(from = as.Date("2021-11-14"), to = as.Date("2022-03-14"), by = 1))
+
+plot(ts_leg0_100,
+     col = 2,
+     ylim = c(0, 1),
+     xlab = "Date",
+     ylab = "mean of leg percentages")
+lines(ts_leg1_100,
+      col = 3)
+lines(ts_leg01_100,
+      col = 4)
+legend("bottomright",                           # Add legend to plot
+       c("ts_leg0_100", "ts_leg1_100", "ts_leg01_100"),
+       lty = 1,
+       col = 2:4)
+```
+##### legs with 0:
+Remains 0.5 at all time.
+```{r}
+auto.arima(ts_leg0_100)
+```
+##### legs with 1:
+ARIMA(1,0,0) with non-zero mean 
+```{r}
+auto.arima(ts_leg1_100)
+```
+##### legs 0,1:
+ARIMA(1,0,0) with non-zero mean 
+```{r}
+auto.arima(ts_leg01_100)
+```
+
+
+
+## cointegration analysis?
+In the sum and 500 fee tier, leg0 and leg01 have similar patterns with gas fee.
