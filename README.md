@@ -1,0 +1,2 @@
+# cryptocurrency_trading
+I constructed a dataset including more than 200,000 observations of 23 crypto token’s triple-wise trading volumes. I designed and conducted regression, ARIMA, structural break, and GARCH analysis on the data. Our goal for the next step is to perform cointegration analysis between standardized ETH/stable coin triple-wise trading volumes and Gas fees. This project will provide insights on how settlement assets react to trading cost, interoperability and liquidity provision.
